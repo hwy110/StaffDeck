@@ -7,6 +7,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "Skill Agent Loop Service"
     database_url: str = "sqlite:///./skill_agent_loop.db"
+    # PostgreSQL 连接池配置 (仅当 database_url 为 postgresql:// 时生效)
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_recycle: int = 1800
     app_secret: str = "change-me-in-development"
     demo_model_base_url: str = "http://localhost:52010/v1"
     demo_model_name: str = "qwen3.6-27b"

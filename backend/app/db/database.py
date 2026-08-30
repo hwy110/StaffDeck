@@ -2,6 +2,7 @@ import hashlib
 import json
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+import logging
 from pathlib import Path
 
 from sqlalchemy import Engine, inspect, text
@@ -10,17 +11,38 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app.config import get_settings
 from app.db.database_path import normalize_database_url
 
+logger = logging.getLogger(__name__)
+
 
 def _normalize_database_url(url: str) -> str:
     """Backward-compatible import seam for callers and migration tests."""
     return normalize_database_url(url)
 
 
+def _build_engine_kwargs(url: str) -> dict:
+    """根据数据库后端类型构建 create_engine 参数。
+
+    - SQLite: check_same_thread=False + busy_timeout
+    - PostgreSQL: 连接池配置 (pool_size, max_overflow, pool_recycle)
+    """
+    kwargs: dict = {"echo": False}
+    if url.startswith("sqlite"):
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+    else:
+        # PostgreSQL / 其他 SQL 数据库: 启用连接池
+        kwargs["pool_size"] = settings.db_pool_size
+        kwargs["max_overflow"] = settings.db_max_overflow
+        kwargs["pool_recycle"] = settings.db_pool_recycle
+        kwargs["pool_pre_ping"] = True
+    return kwargs
+
+
 settings = get_settings()
 
 database_url = _normalize_database_url(settings.database_url)
-connect_args = {"check_same_thread": False, "timeout": 30} if database_url.startswith("sqlite") else {}
-engine: Engine = create_engine(database_url, echo=False, connect_args=connect_args)
+_is_sqlite = database_url.startswith("sqlite")
+_is_postgresql = database_url.startswith("postgresql")
+engine: Engine = create_engine(database_url, **_build_engine_kwargs(database_url))
 
 _DEFAULT_MODEL_OUTPUT_LIMIT_MIGRATION_ID = "20260712_default_model_output_tokens_8192"
 _LEGACY_DEFAULT_MODEL_OUTPUT_TOKENS = 2048
@@ -61,10 +83,46 @@ _CAPABILITY_SCOPE_TABLES = (
 def init_db() -> None:
     import app.db.models  # noqa: F401
 
-    _configure_sqlite_runtime()
-    SQLModel.metadata.create_all(engine)
-    _migrate_sqlite_skill_schema()
-    _purge_orphaned_chat_sessions()
+    if _is_sqlite:
+        _configure_sqlite_runtime()
+        SQLModel.metadata.create_all(engine)
+        _migrate_sqlite_skill_schema()
+        _purge_orphaned_chat_sessions()
+    elif _is_postgresql:
+        _configure_postgresql_runtime()
+        _run_alembic_migrations()
+        _purge_orphaned_chat_sessions()
+    else:
+        # 其他数据库后端: 尝试通用流程
+        SQLModel.metadata.create_all(engine)
+        logger.warning("使用未经测试的数据库后端: %s", database_url.split("://")[0])
+        _purge_orphaned_chat_sessions()
+
+
+def _configure_postgresql_runtime() -> None:
+    """PostgreSQL 初始化: 运行 Alembic 迁移确保 Schema 最新。"""
+    logger.info("PostgreSQL 数据库初始化: %s", database_url.split("@")[-1] if "@" in database_url else "connected")
+
+
+def _run_alembic_migrations() -> None:
+    """通过 Alembic 执行数据库迁移,确保 Schema 与代码模型一致。"""
+    try:
+        from alembic.config import Config
+        from alembic import command
+
+        alembic_cfg = Config()
+        alembic_ini_path = Path(__file__).resolve().parents[2] / "alembic.ini"
+        if alembic_ini_path.exists():
+            alembic_cfg = Config(str(alembic_ini_path))
+        else:
+            # 无 alembic.ini 时手动配置最小参数
+            alembic_cfg.set_main_option("script_location", str(Path(__file__).resolve().parents[2] / "alembic"))
+        alembic_cfg.set_main_option("sqlalchemy.url", database_url)
+        command.upgrade(alembic_cfg, "head")
+        logger.info("Alembic 迁移完成")
+    except Exception as exc:
+        logger.error("Alembic 迁移失败: %s", exc)
+        raise
 
 
 def _purge_orphaned_chat_sessions() -> None:
@@ -624,7 +682,8 @@ def _migrate_sqlite_skill_schema() -> None:
 def _sqlite_immediate_connection():
     conn = engine.connect()
     try:
-        conn.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
         yield conn
         conn.commit()
     except BaseException:
