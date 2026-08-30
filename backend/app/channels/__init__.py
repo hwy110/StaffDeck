@@ -10,6 +10,8 @@ from typing import IO
 
 from app.config import get_settings
 
+from sqlalchemy import text as _sa_text
+
 logger = logging.getLogger(__name__)
 
 # 进程级 ingress 管理器单例(懒创建,测试可替换)
@@ -21,23 +23,49 @@ _binding_lifecycle_locks: dict[str, threading.RLock] = {}
 _binding_lifecycle_locks_guard = threading.Lock()
 _connector_lock_file: IO[bytes] | None = None
 _connector_lock_pid: int | None = None
+_pg_advisory_lock_acquired: bool = False
 _intake_sweep_thread: threading.Thread | None = None
+
+# PostgreSQL advisory lock 固定 key（用于 connector 进程互斥）
+_PG_CONNECTOR_ADVISORY_KEY = 0x5344434F4E  # "SDCON" 的十六进制
 
 
 def _acquire_connector_process_lock() -> bool:
-    global _connector_lock_file, _connector_lock_pid
+    """获取渠道服务进程级互斥锁。
+
+    支持两种后端:
+    - SQLite: 基于文件锁 (fcntl/msvcrt)
+    - PostgreSQL: 基于 advisory lock (pg_try_advisory_lock)
+    """
+    global _connector_lock_file, _connector_lock_pid, _pg_advisory_lock_acquired
     current_pid = os.getpid()
+
+    # SQLite 文件锁已持有
     if _connector_lock_file is not None and _connector_lock_pid == current_pid:
         return True
+    # PG advisory lock 已持有
+    if _pg_advisory_lock_acquired:
+        return True
+
     if _connector_lock_file is not None:
         # preload 后 fork 的子进程不能把继承句柄当作自己已持有锁。
         _connector_lock_file.close()
         _connector_lock_file = None
         _connector_lock_pid = None
+
     from app.db import engine
 
+    backend_name = engine.url.get_backend_name()
+
+    if backend_name in ("postgresql", "postgresql+psycopg2"):
+        return _acquire_pg_advisory_lock(engine)
+
+    if backend_name != "sqlite":
+        logger.error("渠道服务要求进程锁；当前数据库后端 %s 不支持", backend_name)
+        return False
+
     database_path = engine.url.database
-    if engine.url.get_backend_name() != "sqlite" or not database_path or database_path == ":memory:":
+    if not database_path or database_path == ":memory:":
         logger.error("渠道服务要求文件 SQLite 进程锁；当前数据库不支持可靠的单实例 Outbox")
         return False
     lock_path = Path(database_path).resolve().with_name(f"{Path(database_path).name}.connector.lock")
@@ -64,8 +92,53 @@ def _acquire_connector_process_lock() -> bool:
     return True
 
 
+def _acquire_pg_advisory_lock(engine) -> bool:
+    """通过 PostgreSQL advisory lock 实现跨进程互斥。"""
+    global _pg_advisory_lock_acquired
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                _sa_text(
+                    "SELECT pg_try_advisory_lock(:key)"
+                ),
+                {"key": _PG_CONNECTOR_ADVISORY_KEY},
+            ).scalar()
+            if result:
+                _pg_advisory_lock_acquired = True
+                logger.info("PostgreSQL advisory lock 获取成功")
+                return True
+            else:
+                logger.warning("PostgreSQL advisory lock 已被其他进程持有")
+                return False
+    except Exception as exc:
+        logger.error("获取 PostgreSQL advisory lock 失败: %s", exc)
+        return False
+
+
 def _release_connector_process_lock() -> None:
-    global _connector_lock_file, _connector_lock_pid
+    """释放渠道服务进程级互斥锁（支持 SQLite 文件锁和 PG advisory lock）。"""
+    global _connector_lock_file, _connector_lock_pid, _pg_advisory_lock_acquired
+
+    # 释放 PG advisory lock
+    if _pg_advisory_lock_acquired:
+        try:
+            from app.db import engine
+            with engine.connect() as conn:
+                conn.execute(
+                    _sa_text(
+                        "SELECT pg_advisory_unlock(:key)"
+                    ),
+                    {"key": _PG_CONNECTOR_ADVISORY_KEY},
+                )
+                conn.commit()
+            logger.info("PostgreSQL advisory lock 已释放")
+        except Exception as exc:
+            logger.warning("释放 PostgreSQL advisory lock 失败: %s", exc)
+        finally:
+            _pg_advisory_lock_acquired = False
+        return
+
+    # 释放 SQLite 文件锁
     handle = _connector_lock_file
     if handle is None:
         return
